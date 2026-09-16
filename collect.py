@@ -46,6 +46,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import warnings
 from pathlib import Path
@@ -294,9 +295,120 @@ def base_common(proxy):
     return a
 
 
-def download_one(vid, dest_dir, proxy, cookie_args, audio_only) -> bool:
+MEDIA_EXTS = {".mp4", ".m4a", ".mkv", ".webm", ".mp3", ".opus", ".aac", ".flac"}
+
+# 强制「H.264 视频 + AAC(m4a) 音频 + mp4 容器」，保证 Windows / 常见播放器能直接打开。
+# 逐级降级：完全匹配 -> 只要 avc1 -> 渐进式 mp4 -> 任意 mp4 -> 兜底任意流。
+FORMAT_VIDEO = (
+    "bv*[vcodec^=avc1][acodec=none]+ba[ext=m4a][acodec^=mp4a]"
+    "/bv*[ext=mp4][vcodec^=avc1]+ba[ext=m4a]"
+    "/b[ext=mp4][vcodec^=avc1]"
+    "/b[ext=mp4]"
+    "/bv*+ba/b"
+)
+FORMAT_AUDIO = "ba[ext=m4a][acodec^=mp4a]/ba[ext=m4a]/ba"
+
+
+def media_files(dest_dir: Path) -> list:
+    """目录里真正的成品媒体（排除 .part 分片与元数据/封面）"""
+    out = []
+    for f in dest_dir.iterdir():
+        if f.is_file() and f.suffix.lower() in MEDIA_EXTS and not f.name.endswith(".part"):
+            out.append(f)
+    return out
+
+
+def _cleanup_parts(dest_dir: Path):
+    for f in dest_dir.glob("*.part"):
+        try:
+            f.unlink()
+        except Exception:
+            pass
+
+
+PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%\s+of\s")
+DEST_RE = re.compile(r"\[download\]\s+Destination:\s*(.+)$")
+SPEED_RE = re.compile(r"\bat\s+([\d.]+\s*[KMGTP]?i?B/s)")
+ETA_RE = re.compile(r"\bETA\s+([\d:]+)")
+PHASE_BY_EXT = {".mp4": "视频", ".m4a": "音频", ".webm": "视频",
+                ".mp3": "音频", ".opus": "音频", ".mkv": "视频"}
+
+
+class ProgressPrinter:
+    """把 yt-dlp 的实时输出渲染成单行进度条（\r 覆盖刷新）"""
+
+    def __init__(self, prefix: str = "", width: int = 26):
+        self.prefix = prefix
+        self.width = width
+        self.phase = "下载"
+        self.printed = False
+
+    def __call__(self, line: str):
+        m = DEST_RE.search(line)
+        if m:
+            if self.printed:
+                sys.stdout.write("\n")
+                self.printed = False
+            ext = os.path.splitext(m.group(1).strip())[1].lower()
+            self.phase = PHASE_BY_EXT.get(ext, "下载")
+            return
+        m = PROGRESS_RE.search(line)
+        if not m:
+            return
+        pct = float(m.group(1))
+        filled = int(self.width * min(pct, 100) / 100)
+        bar = "█" * filled + "░" * (self.width - filled)
+        sp = SPEED_RE.search(line)
+        eta = ETA_RE.search(line)
+        tail = ""
+        if sp:
+            tail += f"  {sp.group(1)}"
+        if eta:
+            tail += f"  ETA {eta.group(1)}"
+        sys.stdout.write(f"\r{self.prefix}{self.phase} [{bar}] {pct:5.1f}%{tail}")
+        sys.stdout.flush()
+        self.printed = True
+
+    def finish(self):
+        if self.printed:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self.printed = False
+
+
+def _run_stream(args, timeout, on_line):
+    """流式跑 yt-dlp，逐行回调；带超时杀进程。返回 (rc, 输出行列表)"""
+    cmd = [sys.executable, "-m", "yt_dlp", *args]
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, encoding="utf-8", errors="replace",
+                         env=env, bufsize=1)
+    timer = None
+    if timeout:
+        timer = threading.Timer(timeout, p.kill)
+        timer.daemon = True
+        timer.start()
+    lines = []
+    try:
+        while True:
+            line = p.stdout.readline()
+            if not line:
+                break
+            line = line.rstrip("\r\n")
+            lines.append(line)
+            on_line(line)
+        p.wait()
+    finally:
+        if timer:
+            timer.cancel()
+    return p.returncode, lines
+
+
+def download_one(vid, dest_dir, proxy, cookie_args, audio_only, prefix="") -> bool:
     dest_dir.mkdir(parents=True, exist_ok=True)
     a = base_common(proxy) + [
+        "--newline",                      # 进度按行输出，便于实时解析
         "--no-overwrites",
         "--download-archive", str(ARCHIVE_AUDIO if audio_only else ARCHIVE_VIDEO),
         "--write-info-json", "--write-description", "--write-thumbnail",
@@ -305,18 +417,31 @@ def download_one(vid, dest_dir, proxy, cookie_args, audio_only) -> bool:
     ] + cookie_args
 
     if audio_only:
-        a += ["-f", "ba[ext=m4a]/ba", "--extractor-args", "youtube:lang=en"]
+        a += ["-f", FORMAT_AUDIO]
     else:
-        a += ["-f", "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b",
+        a += ["-f", FORMAT_VIDEO,
               "-S", "res:1080,ext:mp4:m4a",
-              "--merge-output-format", "mp4",
-              "--extractor-args", "youtube:lang=en"]
-
+              "--merge-output-format", "mp4"]
+    a += ["--extractor-args", "youtube:lang=en"]
     a += [f"https://www.youtube.com/watch?v={vid}"]
-    rc, out, err = ytdlp(a, timeout=1800)
+
+    printer = ProgressPrinter(prefix=prefix)
+    rc, lines = _run_stream(a, timeout=1800, on_line=printer)
+    printer.finish()
+
     if rc != 0:
-        print(f"\n[!] {vid} 失败 rc={rc}")
-        print((err or out).strip()[-700:])
+        _cleanup_parts(dest_dir)
+        print(f"{prefix}[!] {vid} 失败 rc={rc}")
+        for ln in lines[-6:]:
+            print(prefix + "    " + ln)
+        return False
+
+    # rc=0 也不等于真有成品：合并失败只剩分片 / 命中归档被秒跳过
+    if not media_files(dest_dir):
+        _cleanup_parts(dest_dir)
+        print(f"{prefix}[!] {vid} 无产出媒体文件（合并失败，或该视频已在归档中）")
+        for ln in lines[-6:]:
+            print(prefix + "    " + ln)
         return False
     return True
 
@@ -398,9 +523,10 @@ def main():
     print(f"\n[3/4] 下载 {len(selected)} 条...")
     ok, failed, results = 0, [], []
     for i, r in enumerate(selected, 1):
-        print(f"  ({i}/{len(selected)}) {r['id']} {r['title'][:40]} ...", end=" ", flush=True)
+        print(f"  ({i}/{len(selected)}) {r['id']} {r['title'][:40]}")
         d = topic_dir / safe_dir_name(r["title"], r["id"], topic_dir)
-        if download_one(r["id"], d, args.proxy, cookie_args, args.audio_only):
+        if download_one(r["id"], d, args.proxy, cookie_args, args.audio_only,
+                        prefix="      "):
             meta = write_meta(d)
             ok += 1
             results.append({
@@ -412,10 +538,10 @@ def main():
                 "duration": (meta or {}).get("duration"),
                 "pool_rank_views": r["view_count"],
             })
-            print("OK")
+            print("      → OK")
         else:
             failed.append(r["id"])
-            print("FAIL")
+            print("      → FAIL")
 
     print("\n[4/4] 写任务清单...")
     manifest = {
